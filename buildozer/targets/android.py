@@ -969,7 +969,7 @@ class TargetAndroid(Target):
         extra_manifest_receiver_arguments = self.buildozer.config.getdefault(
             'app', 'android.extra_manifest_receiver_arguments', '')
         if extra_manifest_receiver_arguments:
-            args_body = open(extra_manifest_receiver_arguments, 'rt').read()
+            args_body = open(extra_manifest_receiver_arguments, 'rt').read().replace('"', '\\"')
             cmd.append('--extra-manifest-receiver-arguments="{}"'.format(args_body))
 
         # support for gradle dependencies
