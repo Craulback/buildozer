@@ -965,11 +965,11 @@ class TargetAndroid(Target):
             args_body = open(extra_manifest_application_arguments, 'rt').read().replace('"', '\\"').replace('\n', ' ').replace('\t', ' ')
             cmd.append('--extra-manifest-application-arguments="{}"'.format(args_body))
             
-        # support for extra-manifest-receiver-arguments between <application> and </application>
+        # support for extra-manifest-receiver-arguments between <application> tags
         extra_manifest_receiver_arguments = self.buildozer.config.getdefault(
             'app', 'android.extra_manifest_receiver_arguments', '')
         if extra_manifest_receiver_arguments:
-            args_body = open(extra_manifest_receiver_arguments, 'rt').read().replace('"', '\\"').replace('\n', ' ').replace('\t', ' ')
+            args_body = open(extra_manifest_receiver_arguments, 'rt').read()
             cmd.append('--extra-manifest-receiver-arguments="{}"'.format(args_body))
 
         # support for gradle dependencies
