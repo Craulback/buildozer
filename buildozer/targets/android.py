@@ -9,7 +9,7 @@ if sys.platform == 'win32':
 from platform import uname
 WSL = 'microsoft' in uname()[2].lower()
 
-ANDROID_API = '27'
+ANDROID_API = '31'
 ANDROID_MINAPI = '21'
 APACHE_ANT_VERSION = '1.9.4'
 
@@ -24,14 +24,15 @@ import os
 import io
 import re
 import ast
-from pipes import quote
 from sys import platform, executable
 from buildozer import BuildozerException, USE_COLOR
 from buildozer.target import Target
 from os import environ
 from os.path import exists, join, realpath, expanduser, basename, relpath
 from platform import architecture
-from shutil import copyfile, rmtree
+from shutil import copyfile, rmtree, which
+import shlex
+import pexpect
 from glob import glob
 from time import sleep
 
@@ -81,44 +82,41 @@ class TargetAndroid(Target):
         self._build_dir = join(
             self.buildozer.platform_dir, 'build-{}'.format(self.archs_snake))
         executable = sys.executable or 'python'
-        self._p4a_cmd = '{} -m pythonforandroid.toolchain '.format(executable)
+        self._p4a_cmd = [executable, "-m", "pythonforandroid.toolchain"]
         self._p4a_bootstrap = self.buildozer.config.getdefault(
             'app', 'p4a.bootstrap', 'sdl2')
         color = 'always' if USE_COLOR else 'never'
-        self.extra_p4a_args = ' --color={} --storage-dir="{}"'.format(
-            color, self._build_dir)
+        self.extra_p4a_args = [f"--color={color}", f"--storage-dir={self._build_dir}"]
 
         # minapi should match ndk-api, so can use the same default if
         # nothing is specified
         ndk_api = self.buildozer.config.getdefault(
             'app', 'android.ndk_api', self.android_minapi)
-        self.extra_p4a_args += ' --ndk-api={}'.format(ndk_api)
+        self.extra_p4a_args.append(f"--ndk-api={ndk_api}")
 
         hook = self.buildozer.config.getdefault("app", "p4a.hook", None)
         if hook is not None:
-            self.extra_p4a_args += ' --hook={}'.format(realpath(expanduser(hook)))
+            self.extra_p4a_args.append(f"--hook={realpath(expanduser(hook))}")
         port = self.buildozer.config.getdefault('app', 'p4a.port', None)
         if port is not None:
-            self.extra_p4a_args += ' --port={}'.format(port)
+            self.extra_p4a_args.append(f"--port={port}")
 
         setup_py = self.buildozer.config.getdefault('app', 'p4a.setup_py', False)
         if setup_py:
-            self.extra_p4a_args += ' --use-setup-py'
+            self.extra_p4a_args.append("--use-setup-py")
         else:
-            self.extra_p4a_args += ' --ignore-setup-py'
+            self.extra_p4a_args.append("--ignore-setup-py")
 
         activity_class_name = self.buildozer.config.getdefault(
             'app', 'android.activity_class_name', 'org.kivy.android.PythonActivity')
         if activity_class_name != 'org.kivy.android.PythonActivity':
-            self.extra_p4a_args += ' --activity-class-name={}'.format(activity_class_name)
+            self.extra_p4a_args.append(f"--activity-class-name={activity_class_name}")
 
         if self.buildozer.log_level >= 2:
-            self.extra_p4a_args += ' --debug'
+            self.extra_p4a_args.append("--debug")
 
-        user_extra_p4a_args = self.buildozer.config.getdefault('app', 'p4a.extra_args',
-                                                               None)
-        if user_extra_p4a_args:
-            self.extra_p4a_args += ' ' + user_extra_p4a_args
+        user_extra_p4a_args = self.buildozer.config.getdefault('app', 'p4a.extra_args', "")
+        self.extra_p4a_args.extend(shlex.split(user_extra_p4a_args))
 
         self.warn_on_deprecated_tokens()
 
@@ -132,7 +130,7 @@ class TargetAndroid(Target):
 
     def _p4a(self, cmd, **kwargs):
         kwargs.setdefault('cwd', self.p4a_dir)
-        return self.buildozer.cmd(self._p4a_cmd + cmd + self.extra_p4a_args, **kwargs)
+        return self.buildozer.cmd([*self._p4a_cmd, *cmd, *self.extra_p4a_args], **kwargs)
 
     @property
     def p4a_dir(self):
@@ -189,11 +187,9 @@ class TargetAndroid(Target):
         # Use the android-sdk dir as cwd by default
         android_sdk_dir = self.android_sdk_dir
         kwargs['cwd'] = kwargs.get('cwd', android_sdk_dir)
-        sdkmanager_path = self.sdkmanager_path
-        sdk_root = f"--sdk_root={android_sdk_dir}"
-        command = f"{sdkmanager_path} {sdk_root} " + ' '.join(args)
-        return_child = kwargs.pop('return_child', False)
-        if return_child:
+        command = [self.sdkmanager_path, f"--sdk_root={android_sdk_dir}", *args]
+
+        if kwargs.pop('return_child', False):
             return self.buildozer.cmd_expect(command, **kwargs)
         else:
             kwargs['get_stdout'] = kwargs.get('get_stdout', True)
@@ -265,31 +261,33 @@ class TargetAndroid(Target):
                 self._set_win32_java_home()
             except:
                 traceback.print_exc()
-            self.adb_cmd = join(self.android_sdk_dir, 'platform-tools',
+            self.adb_executable = join(self.android_sdk_dir, 'platform-tools',
                                 'adb.exe')
             self.javac_cmd = self._locate_java('javac.exe')
             self.keytool_cmd = self._locate_java('keytool.exe')
-        # darwin, linux
+        # darwin, linux, freebsd
         else:
-            self.adb_cmd = join(self.android_sdk_dir, 'platform-tools', 'adb')
+            self.adb_executable = join(self.android_sdk_dir, 'platform-tools', 'adb')
             self.javac_cmd = self._locate_java('javac')
             self.keytool_cmd = self._locate_java('keytool')
 
             # Check for C header <zlib.h>.
-            _, _, returncode_dpkg = self.buildozer.cmd('dpkg --version',
-                                                       break_on_error=False)
-            is_debian_like = (returncode_dpkg == 0)
+            is_debian_like = which("dpkg") is not None
             if is_debian_like and \
                     not self.buildozer.file_exists('/usr/include/zlib.h'):
                 raise BuildozerException(
                     'zlib headers must be installed, '
                     'run: sudo apt-get install zlib1g-dev')
 
+            # Override the OS which `sdkmanager` should download the packages for.
+            # This enables download and use of Linux binaries on FreeBSD.
+            if platform.startswith('freebsd'):
+                os.environ['REPO_OS_OVERRIDE'] = 'linux'
+
         # Adb arguments:
         adb_args = self.buildozer.config.getdefault(
-            "app", "android.adb_args", None)
-        if adb_args is not None:
-            self.adb_cmd += ' ' + adb_args
+            "app", "android.adb_args", "")
+        self.adb_args = shlex.split(adb_args)
 
         # Need to add internally installed ant to path for external tools
         # like adb to use
@@ -327,7 +325,7 @@ class TargetAndroid(Target):
         super().check_configuration_tokens(errors)
 
     def _p4a_have_aab_support(self):
-        returncode = self._p4a("aab -h", break_on_error=False, show_output=False)[2]
+        returncode = self._p4a(["aab", "-h"], break_on_error=False)[2]
         if returncode == 0:
             return True
         else:
@@ -420,7 +418,7 @@ class TargetAndroid(Target):
             archive = 'commandlinetools-win-{}_latest.zip'.format(DEFAULT_SDK_TAG)
         elif platform in ('darwin', ):
             archive = 'commandlinetools-mac-{}_latest.zip'.format(DEFAULT_SDK_TAG)
-        elif platform.startswith('linux'):
+        elif platform.startswith('linux') or platform.startswith('freebsd'):
             archive = 'commandlinetools-linux-{}_latest.zip'.format(DEFAULT_SDK_TAG)
         else:
             raise SystemError('Unsupported platform: {0}'.format(platform))
@@ -460,26 +458,28 @@ class TargetAndroid(Target):
 
         is_darwin = platform == 'darwin'
         is_linux = platform.startswith('linux')
+        is_freebsd = platform.startswith('freebsd')
 
         if platform in ('win32', 'cygwin'):
             # Checking of 32/64 bits at Windows from: https://stackoverflow.com/a/1405971/798575
             import struct
             archive = 'android-ndk-r{0}-windows-{1}.zip'
             is_64 = (8 * struct.calcsize("P") == 64)
-        elif is_darwin or is_linux:
-            _platform = 'linux' if is_linux else 'darwin'
+        elif is_darwin or is_linux or is_freebsd:
+            _platform = 'linux' if (is_linux or is_freebsd) else 'darwin'
             if self.android_ndk_version in ['10c', '10d', '10e']:
                 ext = 'bin'
             elif _version <= 10:
                 ext = 'tar.bz2'
             else:
                 ext = 'zip'
-            archive = 'android-ndk-r{0}-' + _platform + '-{1}.' + ext
-            is_64 = (os.uname()[4] == 'x86_64')
+            archive = 'android-ndk-r{0}-' + _platform + '{1}.' + ext
+            is_64 = ('64' in os.uname()[4])
         else:
             raise SystemError('Unsupported platform: {}'.format(platform))
 
         architecture = 'x86_64' if is_64 else 'x86'
+        architecture = '' if _version >= 23 else f'-{architecture}'
         unpacked = 'android-ndk-r{0}'
         archive = archive.format(self.android_ndk_version, architecture)
         unpacked = unpacked.format(self.android_ndk_version)
@@ -560,19 +560,19 @@ class TargetAndroid(Target):
 
         kwargs = {}
         if auto_accept_license:
-            # `SIGPIPE` is not being reported somehow, but `EPIPE` is.
-            # This leads to a stderr "Broken pipe" message which is harmless,
-            # but doesn't look good on terminal, hence redirecting to /dev/null
-            yes_command = 'yes 2>/dev/null'
-            android_sdk_dir = self.android_sdk_dir
-            sdkmanager_path = self.sdkmanager_path
-            sdk_root = f"--sdk_root={android_sdk_dir}"
-            command = f"{yes_command} | {sdkmanager_path} {sdk_root} --licenses"
-            self.buildozer.cmd(command, cwd=self.android_sdk_dir)
+            kwargs["return_child"] = True
         else:
             kwargs['show_output'] = True
 
-        self._sdkmanager(*sdkmanager_commands, **kwargs)
+        ret_child = self._sdkmanager(*sdkmanager_commands, **kwargs)
+
+        if auto_accept_license:
+            while ret_child.isalive():
+                pexp_match = ret_child.expect(
+                    ["(y/N)", pexpect.EOF, pexpect.TIMEOUT], timeout=300
+                )
+                if pexp_match == 0:
+                    ret_child.sendline("y")
 
     def _read_version_subdir(self, *args):
         versions = []
@@ -642,8 +642,7 @@ class TargetAndroid(Target):
         latest_v_build_tools = sorted(available_v_build_tools)[-1]
         if latest_v_build_tools > installed_v_build_tools:
             if not skip_upd:
-                self._android_update_sdk(
-                    '"build-tools;{}"'.format(latest_v_build_tools))
+                self._android_update_sdk(f"build-tools;{latest_v_build_tools}")
                 installed_v_build_tools = latest_v_build_tools
             else:
                 self.buildozer.info(
@@ -658,7 +657,7 @@ class TargetAndroid(Target):
         android_platform = join(self.android_sdk_dir, 'platforms', 'android-{}'.format(self.android_api))
         if not self.buildozer.file_exists(android_platform):
             if not skip_upd:
-                self._sdkmanager('"platforms;android-{}"'.format(self.android_api))
+                self._sdkmanager(f"platforms;android-{self.android_api}")
             else:
                 self.buildozer.info(
                     'Skipping install API {} platform tools due to spec setting'.format(
@@ -749,12 +748,12 @@ class TargetAndroid(Target):
             # check that url/branch has not been changed
             if self.buildozer.file_exists(p4a_dir):
                 cur_url = cmd(
-                    'git config --get remote.origin.url',
+                    ["git", "config", "--get", "remote.origin.url"],
                     get_stdout=True,
                     cwd=p4a_dir,
                 )[0].strip()
                 cur_branch = cmd(
-                    'git branch -vv', get_stdout=True, cwd=p4a_dir
+                    ["git", "branch", "-vv"], get_stdout=True, cwd=p4a_dir
                 )[0].split()[1]
                 if any([cur_url != p4a_url, cur_branch != p4a_branch]):
                     self.buildozer.info(
@@ -764,28 +763,29 @@ class TargetAndroid(Target):
 
             if not self.buildozer.file_exists(p4a_dir):
                 cmd(
-                    (
-                        'git clone -b {p4a_branch} --single-branch '
-                        '{p4a_url} {p4a_dir}'
-                    ).format(
-                        p4a_branch=p4a_branch,
-                        p4a_url=p4a_url,
-                        p4a_dir=self.p4a_directory_name,
-                    ),
+                    [
+                        "git",
+                        "clone",
+                        "-b",
+                        p4a_branch,
+                        "--single-branch",
+                        p4a_url,
+                        self.p4a_directory_name,
+                    ],
                     cwd=self.buildozer.platform_dir,
                 )
             elif self.platform_update:
-                cmd('git clean -dxf', cwd=p4a_dir)
-                current_branch = cmd('git rev-parse --abbrev-ref HEAD',
+                cmd(["git", "clean", "-dxf"], cwd=p4a_dir)
+                current_branch = cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"],
                                      get_stdout=True, cwd=p4a_dir)[0].strip()
                 if current_branch == p4a_branch:
-                    cmd('git pull', cwd=p4a_dir)
+                    cmd(["git", "pull"], cwd=p4a_dir)
                 else:
-                    cmd('git fetch --tags origin {0}:{0}'.format(p4a_branch),
+                    cmd(["git", "fetch", "--tags", "origin", "{0}:{0}".format(p4a_branch)],
                         cwd=p4a_dir)
-                    cmd('git checkout {}'.format(p4a_branch), cwd=p4a_dir)
+                    cmd(["git", "checkout", p4a_branch], cwd=p4a_dir)
             if p4a_commit != 'HEAD':
-                cmd('git reset --hard {}'.format(p4a_commit), cwd=p4a_dir)
+                cmd(["git", "reset", "--hard", p4a_commit], cwd=p4a_dir)
 
         # also install dependencies (currently, only setup.py knows about it)
         # let's extract them.
@@ -798,15 +798,12 @@ class TargetAndroid(Target):
             self.buildozer.error('Failed to read python-for-android setup.py at {}'.format(
                 join(self.p4a_dir, 'setup.py')))
             sys.exit(1)
-        pip_deps = []
-        for dep in deps:
-            pip_deps.append("'{}'".format(dep))
 
         # in virtualenv or conda env
-        options = "--user"
+        options = ["--user"]
         if "VIRTUAL_ENV" in os.environ or "CONDA_PREFIX" in os.environ:
-            options = ""
-        cmd('{} -m pip install -q {} {}'.format(executable, options, " ".join(pip_deps)))
+            options = []
+        cmd([executable, "-m", "pip", "install", "-q", *options, *deps])
 
     def compile_platform(self):
         app_requirements = self.buildozer.config.getlist(
@@ -834,12 +831,12 @@ class TargetAndroid(Target):
             options.append('--local-recipes')
             options.append(local_recipes)
 
-        p4a_create = "create --dist_name={} --bootstrap={} --requirements={} ".format(dist_name, self._p4a_bootstrap, requirements)
+        p4a_create = ["create", f"--dist_name={dist_name}", f"--bootstrap={self._p4a_bootstrap}", f"--requirements={requirements}"]
 
         for arch in self._archs:
-            p4a_create += "--arch {} ".format(arch)
+            p4a_create.append(f"--arch={arch}")
 
-        p4a_create += " ".join(options)
+        p4a_create.extend(options)
 
         self._p4a(p4a_create, get_stdout=True)[0]
 
@@ -890,7 +887,7 @@ class TargetAndroid(Target):
         presplash_color = self.buildozer.config.getdefault('app', 'android.presplash_color', None)
         if presplash_color:
             cmd.append('--presplash-color')
-            cmd.append("'{}'".format(presplash_color))
+            cmd.append("{}".format(presplash_color))
 
         # support for services
         services = self.buildozer.config.getlist('app', 'services', [])
@@ -917,6 +914,12 @@ class TargetAndroid(Target):
             cmd.append('--blacklist')
             cmd.append(realpath(expanduser(blacklist_src)))
 
+        # support for java directory
+        javadirs = self.buildozer.config.getlist('app', 'android.add_src', [])
+        for javadir in javadirs:
+            cmd.append('--add-source')
+            cmd.append(realpath(expanduser(javadir)))
+
         # support for aars
         aars = self.buildozer.config.getlist('app', 'android.add_aars', [])
         for aar in aars:
@@ -933,6 +936,17 @@ class TargetAndroid(Target):
                 asset_src = asset
                 asset_dest = asset
             cmd.append(realpath(expanduser(asset_src)) + ':' + asset_dest)
+
+        # support for res folder
+        resources = self.buildozer.config.getlist('app', 'android.add_resources', [])
+        for resource in resources:
+            cmd.append('--add-resource')
+            if ':' in resource:
+                resource_src, resource_dest = resource.split(":")
+            else:
+                resource_src = resource
+                resource_dest = ""
+            cmd.append(realpath(expanduser(resource_src)) + ':' + resource_dest)
 
         # support for uses-lib
         uses_library = self.buildozer.config.getlist(
@@ -984,21 +998,20 @@ class TargetAndroid(Target):
             cmd.append('--manifest-placeholders')
             cmd.append("{}".format(manifest_placeholders))
 
-        # support disabling of compilation
-        compile_py = self.buildozer.config.getdefault('app', 'android.no-compile-pyo', None)
-        if compile_py:
-            cmd.append('--no-compile-pyo')
+        # support disabling of byte compile for .py files
+        no_byte_compile = self.buildozer.config.getdefault('app', 'android.no-byte-compile-python', False)
+        if no_byte_compile:
+            cmd.append('--no-byte-compile-python')
 
         for arch in self._archs:
             cmd.append('--arch')
             cmd.append(arch)
 
-        cmd = " ".join(cmd)
         self._p4a(cmd)
 
     def get_release_mode(self):
         # aab, also if unsigned is named as *-release
-        if self.check_p4a_sign_env() or self.artifact_format == "aab":
+        if self.check_p4a_sign_env() or self.artifact_format in ["aab", "aar"]:
             return "release"
         return "release-unsigned"
 
@@ -1033,11 +1046,19 @@ class TargetAndroid(Target):
             self.buildozer.environ['ANDROID_SERIAL'] = serial
             self.buildozer.info('Run on {}'.format(serial))
             self.buildozer.cmd(
-                '{adb} shell am start -n {package}/{entry} -a {entry}'.format(
-                    adb=self.adb_cmd,
-                    package=package,
-                    entry=entrypoint),
-                cwd=self.buildozer.global_platform_dir)
+                [
+                    self.adb_executable,
+                    *self.adb_args,
+                    "shell",
+                    "am",
+                    "start",
+                    "-n",
+                    f"{package}/{entrypoint}",
+                    "-a",
+                    entrypoint,
+                ],
+                cwd=self.buildozer.global_platform_dir,
+            )
         self.buildozer.environ.pop('ANDROID_SERIAL', None)
 
         while True:
@@ -1062,14 +1083,14 @@ class TargetAndroid(Target):
                   .format(self.targetname))
             sys.stderr.write('PYTHONPATH={} {}\n'.format(self.p4a_dir, self._p4a_cmd))
         else:
-            self._p4a(' '.join(args) if args else '')
+            self._p4a(args)
 
     def cmd_clean(self, *args):
         '''
         Clean the build and distribution
         '''
-        self._p4a("clean_builds")
-        self._p4a("clean_dists")
+        self._p4a(["clean_builds"])
+        self._p4a(["clean_dists"])
 
     def _get_package(self):
         config = self.buildozer.config
@@ -1118,15 +1139,12 @@ class TargetAndroid(Target):
         # update the project.properties libraries references
         self._update_libraries_references(dist_dir)
 
-        # add src files
-        self._add_java_src(dist_dir)
-
         # generate the whitelist if needed
         self._generate_whitelist(dist_dir)
 
         # build the app
         build_cmd = [
-            ("--name", quote(config.get('app', 'title'))),
+            ("--name", config.get('app', 'title')),
             ("--version", version),
             ("--package", package),
             ("--minsdk", config.getdefault('app', 'android.minapi',
@@ -1154,6 +1172,12 @@ class TargetAndroid(Target):
         features = config.getlist('app', 'android.features', [])
         for feature in features:
             build_cmd += [("--feature", feature)]
+
+        # add res_xml
+        xmlfiles = config.getlist('app', 'android.res_xml', [])
+        for xmlfile in xmlfiles:
+            build_cmd += [("--res_xml", join(self.buildozer.root_dir,
+                                                    xmlfile))]
 
         # android.entrypoint
         entrypoint = config.getdefault('app', 'android.entrypoint', 'org.kivy.android.PythonActivity')
@@ -1258,7 +1282,7 @@ class TargetAndroid(Target):
         # AndroidX ?
         enable_androidx = config.getbooldefault('app',
                                                 'android.enable_androidx',
-                                                False)
+                                                self.android_api > "28")
         if enable_androidx:
             build_cmd += [("--enable-androidx", )]
 
@@ -1328,6 +1352,9 @@ class TargetAndroid(Target):
                 artifact_dir = join(dist_dir, "build", "outputs", "apk", mode_sign)
             elif self.artifact_format == "aab":
                 artifact_dir = join(dist_dir, "build", "outputs", "bundle", mode_sign)
+            elif self.artifact_format == "aar":
+                artifact_dir = join(dist_dir, "build", "outputs", "aar")
+
         else:
             # on ant, the apk use the title, and have version
             bl = u'\'" ,'
@@ -1405,26 +1432,6 @@ class TargetAndroid(Target):
 
         self.buildozer.debug('project.properties updated')
 
-    def _add_java_src(self, dist_dir):
-        java_src = self.buildozer.config.getlist('app', 'android.add_src', [])
-
-        gradle_files = ["build.gradle", "gradle", "gradlew"]
-        is_gradle_build = any((
-            exists(join(dist_dir, x)) for x in gradle_files))
-        if is_gradle_build:
-            src_dir = join(dist_dir, "src", "main", "java")
-            self.buildozer.info(
-                "Gradle project detected, copy files {}".format(src_dir))
-        else:
-            src_dir = join(dist_dir, 'src')
-            self.buildozer.info(
-                "Ant project detected, copy files in {}".format(src_dir))
-
-        for pattern in java_src:
-            for fn in glob(expanduser(pattern.strip())):
-                last_component = basename(fn)
-                self.buildozer.file_copytree(fn, join(src_dir, last_component))
-
     @property
     def serials(self):
         if hasattr(self, '_serials'):
@@ -1432,8 +1439,9 @@ class TargetAndroid(Target):
         serial = environ.get('ANDROID_SERIAL')
         if serial:
             return serial.split(',')
-        lines = self.buildozer.cmd('{} devices'.format(self.adb_cmd),
-                               get_stdout=True)[0].splitlines()
+        lines = self.buildozer.cmd(
+            [self.adb_executable, *self.adb_args, "devices"], get_stdout=True
+        )[0].splitlines()
         serials = []
         for serial in lines:
             if not serial:
@@ -1457,9 +1465,9 @@ class TargetAndroid(Target):
             print('To set up ADB in this shell session, execute:')
             print('    alias adb=$(buildozer {} adb --alias 2>&1 >/dev/null)'
                   .format(self.targetname))
-            sys.stderr.write(self.adb_cmd + '\n')
+            sys.stderr.write(self.adb_executable + '\n')
         else:
-            self.buildozer.cmd(' '.join([self.adb_cmd] + args))
+            self.buildozer.cmd([self.adb_executable, *self.adb_args, *args])
 
     def cmd_deploy(self, *args):
         super().cmd_deploy(*args)
@@ -1482,16 +1490,23 @@ class TargetAndroid(Target):
         for serial in self.serials:
             self.buildozer.environ['ANDROID_SERIAL'] = serial
             self.buildozer.info('Deploy on {}'.format(serial))
-            self.buildozer.cmd('{0} install -r "{1}"'.format(
-                               self.adb_cmd, full_apk),
-                               cwd=self.buildozer.global_platform_dir)
+            self.buildozer.cmd(
+                [self.adb_executable, *self.adb_args, "install", "-r", full_apk],
+                cwd=self.buildozer.global_platform_dir,
+            )
         self.buildozer.environ.pop('ANDROID_SERIAL', None)
 
         self.buildozer.info('Application pushed.')
 
     def _get_pid(self):
         pid, *_ = self.buildozer.cmd(
-            f'{self.adb_cmd} shell pidof {self._get_package()}',
+            [
+                self.adb_executable,
+                *self.adb_args,
+                "shell",
+                "pidof",
+                self._get_package(),
+            ],
             get_stdout=True,
             show_output=False,
             break_on_error=False,
@@ -1520,7 +1535,7 @@ class TargetAndroid(Target):
                 extra_args.extend(('--pid', pid))
 
         self.buildozer.cmd(
-            f"{self.adb_cmd} logcat {filters} {' '.join(extra_args)}",
+            [self.adb_executable, *self.adb_args, "logcat", filters, *extra_args],
             cwd=self.buildozer.global_platform_dir,
             show_output=True,
             run_condition=self._get_pid if pid else None,
